@@ -34,6 +34,8 @@ jobs:
           import argparse
           import datetime as dt
           import json
+          import hashlib
+          import html
           import re
           import urllib.error
           import urllib.parse
@@ -41,7 +43,7 @@ jobs:
           from pathlib import Path
           
           UTC = dt.timezone.utc
-          UA = "Bag1Cloud/0.2 (public research only; no outreach)"
+          UA = "Bag1Cloud/0.3 (public research only; no outreach)"
           LOOKBACK_HOURS = 72
           REDDIT_QUERIES = (
               'subreddit:forhire [hiring] python',
@@ -75,10 +77,41 @@ jobs:
           SCOPE_RE = re.compile(r"\b(csv|spreadsheet|excel|data clean(?:up|ing)?|dedup(?:e|lication)?|invoice|pdf|reconcil(?:e|iation)|n8n|make\.com|automation|workflow|python|webhook|retry|error handling|quality assurance|\bqa\b)\b", re.I)
           
           
+          class ResponseLimitError(ValueError):
+              pass
+          
+          
           def fetch(url: str) -> dict:
               req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
               with urllib.request.urlopen(req, timeout=12) as response:
-                  return json.load(response)
+                  raw = response.read(750001)
+                  if len(raw) > 750000:
+                      raise ResponseLimitError("response exceeds bounded size")
+                  data = json.loads(raw)
+                  if not isinstance(data, dict):
+                      raise ValueError("expected JSON object")
+                  return data
+          
+          
+          def github_offer(record, issue):
+              """Filter issue discovery; never equate a proposal or a label with funding."""
+              title, body = str(issue.get("title") or ""), str(issue.get("body") or "")
+              labels = [x.get("name", "") if isinstance(x, dict) else str(x) for x in issue.get("labels", [])]
+              excluded = []
+              if re.search(r"bounty proposal|paid-scope inquiry|first-dollar mission|daily digest|\[intake|\[wildcard\]", title, re.I):
+                  excluded.append("proposal, submission, digest or internal mission; not an issuer's hiring offer")
+              if re.search(r"\b(?:w?DOOM)\b|\bstar (?:both |the )?repos|\bGPU miner\b", title + "\n" + body, re.I):
+                  excluded.append("token/engagement/mining reward; cash value and compatible service scope unverified")
+              direct_offer = bool(re.search(r"\b(?:i|we) (?:will|can|would like to) pay\b|\b(?:budget|reward|bounty)\s*[:=-]\s*[$£€]\s*\d", body, re.I))
+              labelled = any(re.search(r"\bbounty\b", x, re.I) for x in labels)
+              if not direct_offer and not labelled:
+                  excluded.append("no direct issuer payment offer or bounty label in the original issue")
+              if issue.get("state") != "open":
+                  excluded.append("issue is not currently open")
+              if excluded:
+                  record.update(status="RED", stage="rejected", reasons=list(dict.fromkeys(record["reasons"] + excluded)))
+              record["github_evidence"] = {"author_association": issue.get("author_association", "UNKNOWN"), "labels": labels, "state": issue.get("state", "UNKNOWN"), "body_sha256": hashlib.sha256(body.encode()).hexdigest(), "direct_offer_language": direct_offer, "funding_verified": False}
+              return record
           
           
           def parse_date(value):
@@ -174,6 +207,7 @@ jobs:
           
           def run(now=None, fetcher=None):
               now = parse_date(now) or dt.datetime.now(UTC)
+              supplied_fetcher = fetcher is not None
               fetcher = fetcher or fetch
               found, errors, coverage, seen = [], [], [], set()
           
@@ -184,9 +218,14 @@ jobs:
                       found.append(record)
           
               def fail(source, query, exc):
-                  errors.append({"source": source, "query": query, "error_type": type(exc).__name__})
+                  code = getattr(exc, "code", None)
+                  retry = getattr(exc, "headers", {}).get("Retry-After") if getattr(exc, "headers", None) else None
+                  errors.append({"source": source, "query": query, "error_type": type(exc).__name__, "http_status": code, "retry_after_seconds": int(retry) if retry and str(retry).isdigit() else None, "action": "defer; no immediate retry" if code in (403, 429) else "record failure; continue independent sources"})
           
               for q in REDDIT_QUERIES:
+                  if not supplied_fetcher:
+                      coverage.append({"source": "Reddit", "query": q, "state": "not scanned", "reason": "approved Reddit API integration unavailable; live access disabled; fixtures remain testable"})
+                      continue
                   url = "https://www.reddit.com/search.json?" + urllib.parse.urlencode({"q": q, "sort": "new", "t": "week", "limit": 40})
                   try:
                       data = fetcher(url)
@@ -200,17 +239,24 @@ jobs:
                       fail("Reddit", q, exc)
                       coverage.append({"source": "Reddit", "query": q, "state": "failed"})
           
+              github_rate_limited = False
               for q in GITHUB_QUERIES:
-                  url = "https://api.github.com/search/issues?" + urllib.parse.urlencode({"q": q, "sort": "created", "order": "desc", "per_page": 50})
+                  if github_rate_limited:
+                      coverage.append({"source": "GitHub Issues", "query": q, "state": "not scanned", "reason": "rate limit encountered; deferred remaining queries"})
+                      continue
+                  scoped = q + " in:title,body created:>=" + (now - dt.timedelta(hours=LOOKBACK_HOURS)).date().isoformat()
+                  url = "https://api.github.com/search/issues?" + urllib.parse.urlencode({"q": scoped, "sort": "created", "order": "desc", "per_page": 10})
                   try:
                       data = fetcher(url)
                       items = data.get("items", [])
                       for p in items:
-                          append(candidate("GitHub Issues", p.get("html_url"), p.get("title"), p.get("body"), p.get("created_at"), p.get("user", {}).get("login"), now, f"{p.get('comments', 'UNKNOWN')} comments (not bids)"))
-                      coverage.append({"source": "GitHub Issues", "query": q, "state": "responded", "returned": len(items)})
+                          append(github_offer(candidate("GitHub Issues", p.get("html_url"), p.get("title"), p.get("body"), p.get("created_at"), p.get("user", {}).get("login"), now, f"{p.get('comments', 'UNKNOWN')} comments (not bids)"), p))
+                      coverage.append({"source": "GitHub Issues", "query": q, "state": "responded", "returned": len(items), "per_page": 10, "total_available": data.get("total_count"), "note": "first bounded page only; not exhaustive"})
                   except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
                       fail("GitHub Issues", q, exc)
                       coverage.append({"source": "GitHub Issues", "query": q, "state": "failed"})
+                      headers = getattr(exc, "headers", None) or {}
+                      github_rate_limited = getattr(exc, "code", None) == 429 or (getattr(exc, "code", None) == 403 and (headers.get("X-RateLimit-Remaining") == "0" or headers.get("Retry-After")))
           
               for source, url in COMMUNITIES.items():
                   try:
@@ -219,7 +265,20 @@ jobs:
                       for p in topics:
                           slug, topic_id = p.get("slug"), p.get("id")
                           link = urllib.parse.urljoin(url, f"/t/{slug}/{topic_id}") if slug and topic_id else None
-                          append(candidate(source, link, p.get("title"), p.get("excerpt") or "", p.get("created_at"), "UNKNOWN", now, f"{p.get('posts_count', 'UNKNOWN')} posts (not bids)"))
+                          body, author, stamp = p.get("excerpt") or "", "UNKNOWN", p.get("created_at")
+                          if link and re.search(r"\bhiring\b|\bpaid\b|looking for.*(?:expert|developer|freelancer)", p.get("title", ""), re.I):
+                              try:
+                                  detail = fetcher(urllib.parse.urljoin(url, f"/t/{topic_id}.json"))
+                                  posts = detail.get("post_stream", {}).get("posts", [])
+                                  first = next((x for x in posts if x.get("post_number") == 1), None)
+                                  if first is None:
+                                      raise ValueError("original post absent")
+                                  body = html.unescape(re.sub(r"<[^>]+>", " ", first.get("cooked", "")))
+                                  author, stamp = first.get("username") or "UNKNOWN", first.get("created_at")
+                                  coverage.append({"source": source, "state": "original post read", "url": link})
+                              except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+                                  fail(source, f"original topic {topic_id}", exc)
+                          append(candidate(source, link, p.get("title"), body, stamp, author, now, f"{p.get('posts_count', 'UNKNOWN')} posts (not bids)"))
                       coverage.append({"source": source, "state": "responded", "returned": len(topics), "note": "latest topics only; may not include full buyer post body"})
                   except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
                       fail(source, "latest topics", exc)
@@ -235,6 +294,7 @@ jobs:
                   "generated_at": now.isoformat(),
                   "lookback_hours": LOOKBACK_HOURS,
                   "counts": counts,
+                  "source_health": "PARTIAL: Reddit approval unavailable; see source coverage and errors",
                   "source_coverage": coverage,
                   "source_errors": errors,
                   "qualification_note": "Never GREEN automatically; manual evidence and exact-job test required. No outreach or commitments.",
@@ -356,6 +416,87 @@ jobs:
           if __name__ == "__main__":
               unittest.main()
           BAG1_TEST_END
+          cat > tools/bag1_cloud/tests/test_repair.py <<'BAG1_REPAIR_TEST_END'
+          import datetime as dt
+          import unittest
+          import urllib.error
+          from unittest.mock import patch
+          from bag1 import candidate, github_offer, run
+          
+          NOW = dt.datetime(2026, 10, 23, 21, tzinfo=dt.timezone.utc)
+          
+          
+          class RepairedDiscovery(unittest.TestCase):
+              def offer(self, title, body, labels=()):
+                  issue = dict(title=title, body=body, state='open', labels=[{'name': x} for x in labels], author_association='NONE')
+                  record = candidate('GitHub Issues', 'https://github.com/example/repo/issues/1', title, body, '2026-10-23T15:00:00Z', 'author', NOW)
+                  return github_offer(record, issue)
+          
+              def test_contributor_proposal_is_not_buyer_budget(self):
+                  r = self.offer('[Bounty proposal] Python CSV repair', 'Proposed reward: $50; my patch is ready')
+                  self.assertEqual(r['status'], 'RED')
+          
+              def test_internal_income_mission_is_not_a_job(self):
+                  self.assertEqual(self.offer('First-Dollar Mission', 'Find paid Python bounty tasks to earn $2000')['status'], 'RED')
+          
+              def test_security_report_mentions_bounty_without_offer(self):
+                  self.assertEqual(self.offer('Python security report', 'This bug report is not a claim against a bounty; paid APIs unchanged')['status'], 'RED')
+          
+              def test_token_reward_not_cash_budget(self):
+                  self.assertEqual(self.offer('[BOUNTY] 500 DOOM', 'Run Python GPU miner to receive DOOM', ['bounty'])['status'], 'RED')
+          
+              def test_cash_offer_stays_unverified_not_green(self):
+                  r = self.offer('[HIRING] Python CSV repair', 'I will pay $100 for CSV deduplication')
+                  self.assertEqual(r['status'], 'YELLOW')
+                  self.assertFalse(r['github_evidence']['funding_verified'])
+          
+              def test_label_alone_does_not_certify_buyer(self):
+                  r = self.offer('Python CSV bug', 'A bounty may be considered; no terms yet', ['bounty'])
+                  self.assertNotEqual(r['status'], 'GREEN')
+          
+              def test_default_reddit_disabled_without_api_probe(self):
+                  urls = []
+                  def fake(url):
+                      urls.append(url)
+                      return {'items': []} if 'api.github.com' in url else {'topic_list': {'topics': []}}
+                  with patch('bag1.fetch', side_effect=fake):
+                      r = run(NOW)
+                  self.assertFalse(any('reddit.com' in u for u in urls))
+                  self.assertEqual(sum(x['source']=='Reddit' and x['state']=='not scanned' for x in r['source_coverage']), 6)
+                  self.assertIn('PARTIAL', r['source_health'])
+                  self.assertTrue(all('in%3Atitle%2Cbody' in u and 'created%3A' in u for u in urls if 'api.github.com' in u))
+          
+              def test_http_status_retained_and_rate_limit_stops_dependent_queries(self):
+                  urls = []
+                  def fake(url):
+                      urls.append(url)
+                      if 'api.github.com' in url:
+                          raise urllib.error.HTTPError(url, 403, 'rate limit', {'X-RateLimit-Remaining': '0', 'Retry-After': '60'}, None)
+                      return {'topic_list': {'topics': []}}
+                  with patch('bag1.fetch', side_effect=fake):
+                      r = run(NOW)
+                  self.assertEqual(len([u for u in urls if 'api.github.com' in u]), 1)
+                  self.assertEqual(r['source_errors'][0]['http_status'], 403)
+                  self.assertEqual(r['source_errors'][0]['retry_after_seconds'], 60)
+                  self.assertTrue(any('community.make.com' in u for u in urls))
+          
+              def test_original_forum_post_supplies_author_and_actual_budget(self):
+                  def fake(url):
+                      if '/t/123.json' in url:
+                          return {'post_stream': {'posts': [{'post_number': 1, 'username': 'buyer', 'created_at': '2026-10-23T15:00:00Z', 'cooked': '<p>Budget: $25. Need automation repair.</p>'}]}}
+                      if 'community.make.com' in url:
+                          return {'topic_list': {'topics': [{'id': 123, 'slug': 'hiring-make-expert', 'title': 'Hiring Make expert', 'created_at': '2026-10-23T15:00:00Z'}]}}
+                      return {'items': [], 'topic_list': {'topics': []}}
+                  with patch('bag1.fetch', side_effect=fake):
+                      r = run(NOW)
+                  self.assertEqual(r['candidates'][0]['author'], 'buyer')
+                  self.assertIn('$25', r['candidates'][0]['compensation_scope'])
+                  self.assertEqual(r['candidates'][0]['status'], 'YELLOW')
+          
+          
+          if __name__ == '__main__':
+              unittest.main()
+          BAG1_REPAIR_TEST_END
       - name: Verify qualification rules
         run: python3 -m unittest discover -s tests -v
       - name: Execute public read-only discovery
