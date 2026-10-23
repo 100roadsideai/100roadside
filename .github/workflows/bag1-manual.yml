@@ -1,0 +1,383 @@
+name: Bag 1 Cloud Proof
+on:
+  push:
+    branches: [codex/bag1-cloud-20261019]
+    paths:
+      - '.github/workflows/bag1-manual.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: bag1-cloud-proof-20261019
+  cancel-in-progress: false
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    defaults:
+      run:
+        working-directory: tools/bag1_cloud
+    steps:
+      - name: Prepare existing read-only scout
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          mkdir -p tools/bag1_cloud/tests
+          cat > tools/bag1_cloud/bag1.py <<'BAG1_SOURCE_END'
+          """Bag 1 phone/cloud discovery. Public read-only sources, manual execution only.
+          
+          This scanner never contacts buyers or marks a candidate GREEN. It distinguishes
+          fresh paid-buyer evidence from speculative demand and preserves source failures.
+          """
+          from __future__ import annotations
+          
+          import argparse
+          import datetime as dt
+          import json
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          
+          UTC = dt.timezone.utc
+          UA = "Bag1Cloud/0.2 (public research only; no outreach)"
+          LOOKBACK_HOURS = 72
+          REDDIT_QUERIES = (
+              'subreddit:forhire [hiring] python',
+              'subreddit:forhire [hiring] automation',
+              'subreddit:forhire [hiring] csv',
+              'subreddit:forhire [hiring] agency subcontractor',
+              'subreddit:slavelabour [task] spreadsheet',
+              'subreddit:forhire [hiring] n8n',
+          )
+          GITHUB_QUERIES = (
+              'is:issue is:open bounty python',
+              'is:issue is:open "paid" automation',
+              'is:issue is:open "reward" csv',
+              'is:issue is:open "paid" invoice',
+          )
+          COMMUNITIES = {
+              "n8n Community": "https://community.n8n.io/latest.json",
+              "Make Community": "https://community.make.com/latest.json",
+          }
+          DISCORD_DIRECTORIES = [
+              "https://discord.com/servers/jobs-hiring-market-business-freelancing-jobs-smma-1024730510880165968",
+              "https://www.deepcord.com/server/pi98zh2s6q",
+              "https://www.deepcord.com/server/phakv0snsd",
+          ]
+          SELLER_RE = re.compile(r"\b(for hire|hire me|available for work|my services|my portfolio|i offer|freelancer available|offering services)\b", re.I)
+          NO_PAY_RE = re.compile(r"\b(unpaid|volunteer|no pay|not paid|not hiring|no budget|pro bono)\b", re.I)
+          FEE_RE = re.compile(r"\b(pay to apply|upfront fee|application fee|paid membership|buy connects|purchase connects|paywall|registration fee)\b", re.I)
+          BUYER_RE = re.compile(r"\b(\[hiring\]|\[task\]|hiring|seeking (?:a |an )?(?:freelancer|developer|contractor|subcontractor)|looking for (?:a |an )?(?:freelancer|developer|contractor|expert|someone)|need (?:a |an )?(?:freelancer|developer|contractor)|paid (?:project|test|task|gig)|bounty|contract work|subcontract(?:or|ing))\b", re.I)
+          PAID_RE = re.compile(r"(?:[$£€]\s?\d[\d,]*(?:\.\d{1,2})?|\b(?:USD|GBP|EUR)\s?\d[\d,]*|\b(?:paid|payment|compensation|budget|bounty|hourly rate|per hour|per project)\b)", re.I)
+          AMOUNT_RE = re.compile(r"(?:[$£€]\s?\d[\d,]*(?:\.\d{1,2})?|\b(?:USD|GBP|EUR)\s?\d[\d,]*)", re.I)
+          SCOPE_RE = re.compile(r"\b(csv|spreadsheet|excel|data clean(?:up|ing)?|dedup(?:e|lication)?|invoice|pdf|reconcil(?:e|iation)|n8n|make\.com|automation|workflow|python|webhook|retry|error handling|quality assurance|\bqa\b)\b", re.I)
+          
+          
+          def fetch(url: str) -> dict:
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+              with urllib.request.urlopen(req, timeout=12) as response:
+                  return json.load(response)
+          
+          
+          def parse_date(value):
+              if not value:
+                  return None
+              try:
+                  if isinstance(value, (int, float)):
+                      return dt.datetime.fromtimestamp(value, UTC)
+                  parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                  return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+              except (ValueError, TypeError, OverflowError):
+                  return None
+          
+          
+          def canonical_url(url):
+              if not isinstance(url, str):
+                  return None
+              try:
+                  parsed = urllib.parse.urlsplit(url.strip())
+                  if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+                      return None
+                  # Drop tracking query/fragment, preserving the actual original post URL.
+                  return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.lower(), parsed.path.rstrip("/") or "/", "", ""))
+              except ValueError:
+                  return None
+          
+          
+          def service_match(text):
+              if re.search(r"invoice|pdf|reconcil", text, re.I):
+                  return "invoice/PDF reconciliation"
+              if re.search(r"n8n|make\.com|automation|workflow|webhook|retry", text, re.I):
+                  return "workflow reliability repair"
+              if re.search(r"csv|spreadsheet|excel|data clean|dedup", text, re.I):
+                  return "CSV cleanup"
+              return "unmatched"
+          
+          
+          def candidate(source, url, title, body, timestamp, author, now, competition="UNKNOWN"):
+              now = parse_date(now) or dt.datetime.now(UTC)
+              posted = parse_date(timestamp)
+              original = canonical_url(url)
+              title, body = str(title or ""), str(body or "")
+              text = f"{title}\n{body}"
+              reasons = []
+              if not original:
+                  reasons.append("direct original post URL missing or invalid")
+              if not posted:
+                  reasons.append("original post timestamp missing or invalid")
+              elif posted > now + dt.timedelta(minutes=5):
+                  reasons.append("original post timestamp is in the future")
+              elif now - posted > dt.timedelta(hours=LOOKBACK_HOURS):
+                  reasons.append("original post older than 72 hours")
+              if SELLER_RE.search(title):
+                  reasons.append("seller advertisement")
+              if FEE_RE.search(text):
+                  reasons.append("upfront cost or inaccessible paid contact route")
+              if NO_PAY_RE.search(text):
+                  reasons.append("explicitly unpaid or not hiring")
+              buyer = bool(BUYER_RE.search(text))
+              paid = bool(PAID_RE.search(text))
+              scope = bool(SCOPE_RE.search(text))
+              if not buyer:
+                  reasons.append("unconfirmed buyer demand; problem statement alone is not a paid lead")
+              if not paid:
+                  reasons.append("no explicit paid intent or compensation")
+              if not scope:
+                  reasons.append("no relevant scoped service identified")
+              match = service_match(text)
+              amount = AMOUNT_RE.search(text)
+              status = "RED" if reasons else "YELLOW"
+              if status == "YELLOW":
+                  reasons = ["free contact not verified for owner account", "exact job not currently tested for deliverability", "buyer/payment details require independent verification"]
+              return {
+                  "source": source,
+                  "original_url": original,
+                  "original_posted_at": posted.isoformat() if posted else None,
+                  "title": title[:240],
+                  "author": author or "UNKNOWN",
+                  "status": status,
+                  "reasons": reasons,
+                  "buyer_evidence": "explicit buyer/hiring language in original post" if buyer else "UNCONFIRMED",
+                  "compensation_scope": (f"Buyer-post amount mentioned: {amount.group(0)}; full terms UNVERIFIED" if amount else "Paid intent stated; amount UNKNOWN" if paid else "UNCONFIRMED"),
+                  "free_contact_route": "platform reply/DM may exist; $0 access NOT VERIFIED" if original else "UNKNOWN",
+                  "competition": competition,
+                  "service_match": match,
+                  "suggested_price": "NOT SET; any future suggestion is not a buyer budget",
+                  "local_delivery": "historical capabilities only; exact-job current acceptance tests NOT RUN",
+                  "approval_gate": "Owner must approve qualification contact after free route, buyer, terms, and exact-job feasibility are verified",
+                  "stage": "lead" if status == "YELLOW" else "rejected",
+                  "stage_evidence": "public original post only" if status == "YELLOW" else "; ".join(reasons),
+              }
+          
+          
+          def run(now=None, fetcher=None):
+              now = parse_date(now) or dt.datetime.now(UTC)
+              fetcher = fetcher or fetch
+              found, errors, coverage, seen = [], [], [], set()
+          
+              def append(record):
+                  url = record.get("original_url")
+                  if url and url not in seen:
+                      seen.add(url)
+                      found.append(record)
+          
+              def fail(source, query, exc):
+                  errors.append({"source": source, "query": query, "error_type": type(exc).__name__})
+          
+              for q in REDDIT_QUERIES:
+                  url = "https://www.reddit.com/search.json?" + urllib.parse.urlencode({"q": q, "sort": "new", "t": "week", "limit": 40})
+                  try:
+                      data = fetcher(url)
+                      children = data.get("data", {}).get("children", [])
+                      for entry in children:
+                          p = entry.get("data", {})
+                          link = "https://www.reddit.com" + p["permalink"] if p.get("permalink", "").startswith("/") else None
+                          append(candidate("Reddit", link, p.get("title"), p.get("selftext"), p.get("created_utc"), p.get("author"), now, f"{p.get('num_comments', 'UNKNOWN')} comments (not applications)"))
+                      coverage.append({"source": "Reddit", "query": q, "state": "responded", "returned": len(children)})
+                  except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+                      fail("Reddit", q, exc)
+                      coverage.append({"source": "Reddit", "query": q, "state": "failed"})
+          
+              for q in GITHUB_QUERIES:
+                  url = "https://api.github.com/search/issues?" + urllib.parse.urlencode({"q": q, "sort": "created", "order": "desc", "per_page": 50})
+                  try:
+                      data = fetcher(url)
+                      items = data.get("items", [])
+                      for p in items:
+                          append(candidate("GitHub Issues", p.get("html_url"), p.get("title"), p.get("body"), p.get("created_at"), p.get("user", {}).get("login"), now, f"{p.get('comments', 'UNKNOWN')} comments (not bids)"))
+                      coverage.append({"source": "GitHub Issues", "query": q, "state": "responded", "returned": len(items)})
+                  except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+                      fail("GitHub Issues", q, exc)
+                      coverage.append({"source": "GitHub Issues", "query": q, "state": "failed"})
+          
+              for source, url in COMMUNITIES.items():
+                  try:
+                      data = fetcher(url)
+                      topics = data.get("topic_list", {}).get("topics", [])
+                      for p in topics:
+                          slug, topic_id = p.get("slug"), p.get("id")
+                          link = urllib.parse.urljoin(url, f"/t/{slug}/{topic_id}") if slug and topic_id else None
+                          append(candidate(source, link, p.get("title"), p.get("excerpt") or "", p.get("created_at"), "UNKNOWN", now, f"{p.get('posts_count', 'UNKNOWN')} posts (not bids)"))
+                      coverage.append({"source": source, "state": "responded", "returned": len(topics), "note": "latest topics only; may not include full buyer post body"})
+                  except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+                      fail(source, "latest topics", exc)
+                      coverage.append({"source": source, "state": "failed"})
+          
+              for source in ("GitHub Discussions", "agency private channels"):
+                  coverage.append({"source": source, "state": "not scanned", "reason": "requires authenticated access or dedicated adapter"})
+              for url in DISCORD_DIRECTORIES:
+                  coverage.append({"source": "Discord directory", "url": url, "state": "directory only", "reason": "not a verified job post; private messages not accessed"})
+          
+              counts = {key: sum(x["status"] == key for x in found) for key in ("GREEN", "YELLOW", "RED")}
+              return {
+                  "generated_at": now.isoformat(),
+                  "lookback_hours": LOOKBACK_HOURS,
+                  "counts": counts,
+                  "source_coverage": coverage,
+                  "source_errors": errors,
+                  "qualification_note": "Never GREEN automatically; manual evidence and exact-job test required. No outreach or commitments.",
+                  "conversion": {"qualified": "UNVERIFIED", "owner_approved": 0, "contacted": 0, "replied": 0, "contracted": 0, "paid": 0, "verified_revenue": "UNKNOWN"},
+                  "candidates": found,
+              }
+          
+          
+          def report_markdown(result):
+              counts = result["counts"]
+              lines = ["# Bag 1 — Manual Discovery Report", "", f"Generated: {result['generated_at']}", f"Original-post window: preceding {result.get('lookback_hours', 72)} hours", "", f"**GREEN {counts['GREEN']} / YELLOW {counts['YELLOW']} / RED {counts['RED']}**", "", "No outreach, applications, bids, contracts, spending or repository commits.", "", "## Candidates requiring review", ""]
+              yellow = [x for x in result["candidates"] if x["status"] == "YELLOW"]
+              for item in yellow[:25]:
+                  lines.extend([f"### {item.get('title') or item.get('id') or 'Untitled opportunity'}", f"- Original: {item['original_url']}", f"- Posted: {item.get('original_posted_at') or item.get('original_timestamp_display') or 'UNKNOWN'}", f"- Evidence: {item['buyer_evidence']}", f"- Pay/scope: {item.get('compensation_scope', 'UNKNOWN')} / {item.get('service_match', 'UNMAPPED')}", f"- Contact: {item['free_contact_route']}", f"- Competition: {item['competition']}", f"- Gap: {'; '.join(item.get('reasons', [item.get('exact_job_proof', 'UNKNOWN')]))}", f"- Gate: {item['approval_gate']}", ""])
+              if not yellow:
+                  lines.append("No YELLOW candidates identified in the sources that responded. This is not proof that none exist.\n")
+              lines.extend(["## Source coverage", ""])
+              for row in result.get("source_coverage", []):
+                  lines.append(f"- {row['source']}: {row['state']}" + (f" — {row['reason']}" if row.get("reason") else ""))
+              lines.extend(["", "## Conversion / revenue", "", "No verified contacts, contracts or revenue in this isolated scout. Historical revenue UNKNOWN.", ""])
+              return "\n".join(lines)
+          
+          
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--output", default="reports/bag1-latest.json")
+              parser.add_argument("--markdown", default="reports/bag1-latest.md")
+              parser.add_argument("--fixture", help="Use a saved fixture JSON report without network access")
+              args = parser.parse_args()
+              result = json.loads(Path(args.fixture).read_text(encoding="utf-8")) if args.fixture else run()
+              for path, content in ((Path(args.output), json.dumps(result, indent=2, ensure_ascii=False) + "\n"), (Path(args.markdown), report_markdown(result))):
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_text(content, encoding="utf-8")
+              print(json.dumps({"counts": result["counts"], "source_errors": result.get("source_errors", []), "report": args.output, "markdown": args.markdown}))
+          
+          
+          if __name__ == "__main__":
+              main()
+          BAG1_SOURCE_END
+          cat > tools/bag1_cloud/tests/test_bag1.py <<'BAG1_TEST_END'
+          import datetime as dt
+          import unittest
+          from bag1 import candidate, canonical_url, parse_date, report_markdown, run
+          
+          NOW = dt.datetime(2026, 10, 19, 12, tzinfo=dt.timezone.utc)
+          
+          
+          class QualificationRules(unittest.TestCase):
+              def make(self, title="[HIRING] Need Python CSV cleanup", body="Paid $100 to dedupe CSV", timestamp="2026-10-18T18:00:00Z", url="https://example.org/1"):
+                  return candidate("test", url, title, body, timestamp, "buyer", NOW)
+          
+              def test_fresh_explicit_paid_buyer_is_yellow_not_green(self):
+                  x = self.make()
+                  self.assertEqual(x["status"], "YELLOW")
+                  self.assertIn("exact job", x["reasons"][1])
+          
+              def test_stale_original_is_red(self):
+                  self.assertEqual(self.make(timestamp="2026-10-10T18:00:00Z")["status"], "RED")
+          
+              def test_seller_ad_is_red(self):
+                  self.assertEqual(self.make(title="[FOR HIRE] Python automation developer")["status"], "RED")
+          
+              def test_upfront_fee_is_red(self):
+                  self.assertEqual(self.make(body="Paid $100; pay to apply")["status"], "RED")
+          
+              def test_problem_statement_without_hiring_is_red(self):
+                  x = self.make(title="Why does my n8n fail?", body="Help, my workflow broke")
+                  self.assertEqual(x["status"], "RED")
+                  self.assertTrue(any("unconfirmed buyer demand" in reason for reason in x["reasons"]))
+          
+              def test_unpaid_or_not_hiring_is_red(self):
+                  self.assertEqual(self.make(body="Unpaid volunteer project for CSV cleanup")["status"], "RED")
+                  self.assertEqual(self.make(title="Not hiring n8n contractors", body="Paid $100 for QA")["status"], "RED")
+          
+              def test_no_paid_intent_is_red(self):
+                  self.assertEqual(self.make(body="Need CSV dedupe help")["status"], "RED")
+          
+              def test_future_post_is_red(self):
+                  self.assertEqual(self.make(timestamp="2026-10-20T18:00:00Z")["status"], "RED")
+          
+              def test_missing_or_invalid_original_is_red(self):
+                  self.assertEqual(self.make(url="")["status"], "RED")
+                  self.assertEqual(self.make(timestamp="not-a-date")["status"], "RED")
+          
+              def test_utc_normalization(self):
+                  self.assertEqual(parse_date("2026-10-19T08:00:00-04:00"), NOW)
+          
+              def test_url_normalization_dedupes_tracking(self):
+                  self.assertEqual(canonical_url("https://EXAMPLE.org/1/?utm_source=x#comment"), "https://example.org/1")
+          
+              def test_service_match_invoice(self):
+                  self.assertEqual(self.make(body="Paid $100 to reconcile invoice PDF files")["service_match"], "invoice/PDF reconciliation")
+          
+              def test_readonly_mock_discovery_dedupes_and_reports_coverage(self):
+                  def fake_fetch(url):
+                      if "reddit.com" in url:
+                          return {"data": {"children": [{"data": {"title": "[HIRING] CSV cleanup", "selftext": "Paid $100 for dedupe", "permalink": "/r/forhire/comments/a/", "created_utc": 1792320000, "author": "buyer", "num_comments": 2}}]}}
+                      if "api.github.com" in url:
+                          return {"items": []}
+                      if "latest.json" in url:
+                          return {"topic_list": {"topics": []}}
+                      raise ValueError("unknown")
+                  result = run(NOW, fetcher=fake_fetch)
+                  self.assertEqual(len(result["candidates"]), 1)
+                  self.assertEqual(result["candidates"][0]["source"], "Reddit")
+                  self.assertEqual(result["counts"]["GREEN"], 0)
+                  self.assertIn("GitHub Discussions", [x["source"] for x in result["source_coverage"]])
+                  self.assertIn("GREEN", report_markdown(result))
+          
+              def test_source_failure_not_silent(self):
+                  def fake_fetch(_):
+                      raise ValueError("blocked")
+                  result = run(NOW, fetcher=fake_fetch)
+                  self.assertEqual(result["counts"], {"GREEN": 0, "YELLOW": 0, "RED": 0})
+                  self.assertGreater(len(result["source_errors"]), 0)
+                  self.assertTrue(any(x["state"] == "failed" for x in result["source_coverage"]))
+          
+          
+          if __name__ == "__main__":
+              unittest.main()
+          BAG1_TEST_END
+      - name: Verify qualification rules
+        run: python3 -m unittest discover -s tests -v
+      - name: Execute public read-only discovery
+        run: python3 bag1.py --output reports/bag1-latest.json --markdown reports/bag1-latest.md
+      - name: Record execution evidence
+        env:
+          RUN_ID: ${{ github.run_id }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib,json,os,pathlib
+          p=pathlib.Path('reports/bag1-latest.json');r=json.loads(p.read_text())
+          receipt={'run_id':os.environ['RUN_ID'],'commit_sha':os.environ['COMMIT_SHA'],'runner_environment':os.environ['RUNNER_KIND'],'report_sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'counts':r['counts'],'home_node_required':False,'outreach_sent':False,'paid_apis_used':False}
+          pathlib.Path('reports/execution-receipt.json').write_text(json.dumps(receipt,indent=2))
+          print(json.dumps(receipt))
+          PYCODE
+      - name: Save public-source report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: bag1-cloud-proof
+          path: tools/bag1_cloud/reports/
+          if-no-files-found: error
+          retention-days: 1
